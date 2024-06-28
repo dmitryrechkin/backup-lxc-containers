@@ -58,6 +58,11 @@ clean_old_backups() {
 for container_id in "${CONTAINER_LIST[@]}"; do
 	backup_container $container_id
 	if [ $? -eq 0 ]; then
+		# Sometimes backup can corrupt state of the container, so restart it to fix possible issues
+		echo "Restart container to fix possible issues..."
+		pct stop $container_id
+		pct start $container_id
+
 		echo "Backup successful for container $container_id. Moving to target backup folder and cleaning old backups..."
 		mv $LOCAL_BACKUP_DIR/vzdump-lxc-$container_id-* $TARGET_BACKUP_DIR/
 		clean_old_backups $container_id
