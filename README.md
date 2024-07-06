@@ -48,6 +48,7 @@ cd backup-lxc-containers
    - `DAYS_TO_KEEP`: Number of days to retain backups (default is 7).
    - `EMAIL_RECIPIENT`: Email address to notify upon successful backups.
    - `COMPRESSION`: Compression used for the backup.
+   - `CHECK_MOUNTPOINT`: Check if any part of the path is a mount point. It is useful when backing up to an external target like an S3 bucket.
 
 2. **Make the Script Executable:**
 
@@ -92,6 +93,7 @@ CONTAINERS="102,103"
 DAYS_TO_KEEP=7
 EMAIL_RECIPIENT="your-email@example.com"
 COMPRESSION="zst"
+CHECK_MOUNTPOINT=true
 ```
 
 Run the script manually:
@@ -111,6 +113,7 @@ CONTAINERS="104,105,106"
 DAYS_TO_KEEP=5
 EMAIL_RECIPIENT="admin@example.com"
 COMPRESSION="gzip"
+CHECK_MOUNTPOINT=true
 ```
 
 Schedule the script to run daily at 3 AM:

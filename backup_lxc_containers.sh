@@ -21,10 +21,43 @@ TARGET_BACKUP_DIR=${TARGET_BACKUP_DIR:-$LOCAL_BACKUP_DIR}
 BACKUP_SUCCESS=true
 EMAIL_RECIPIENT=${EMAIL_RECIPIENT:-root}
 COMPRESSION=${COMPRESSION:-gzip}
+CHECK_MOUNTPOINT=${CHECK_MOUNTPOINT:-false}
 
-# Check if target backup directory is mounted
-if [ "$TARGET_BACKUP_DIR" != "$LOCAL_BACKUP_DIR" ]; then
-	if ! mountpoint -q $TARGET_BACKUP_DIR; then
+# Function to check if any part of the path is a mount point
+check_mount_point() {
+	local path=$1
+	echo "Checking if $path is a mount point..."
+
+	while [ "$path" != "/" ]; do
+		echo "Checking $path..."
+		if mountpoint -q "$path"; then
+			echo "$path is a mount point."
+			return 0
+		fi
+		path=$(dirname "$path")
+	done
+
+	echo "No mount point found for $path."
+	return 1
+}
+
+# Function to perform backup
+backup_container() {
+	local container_id=$1
+	vzdump $container_id --dumpdir $LOCAL_BACKUP_DIR --mode snapshot --compress $COMPRESSION --mailto "$EMAIL_RECIPIENT"
+	return $?
+}
+
+# Function to clean old backups for a specific container
+clean_old_backups() {
+	local container_id=$1
+	find $TARGET_BACKUP_DIR -type f -name "vzdump-lxc-$container_id-*.tar" -o -name "vzdump-lxc-$container_id-*.tar.gz" -o -name "vzdump-lxc-$container_id-*.lzo" -o -name "vzdump-lxc-$container_id-*.vma" -o -name "vzdump-lxc-$container_id-*.log" -mtime +$DAYS_TO_KEEP -exec rm -f {} \;
+}
+
+
+# Check if target backup directory is mounted, if required
+if [ "$CHECK_MOUNTPOINT" = true ] && [ "$TARGET_BACKUP_DIR" != "$LOCAL_BACKUP_DIR" ]; then
+	if ! check_mount_point "$TARGET_BACKUP_DIR"; then
 		echo "Target backup directory $TARGET_BACKUP_DIR is not mounted. Exiting..."
 		exit 1
 	fi
@@ -41,19 +74,6 @@ if ! command -v vzdump &> /dev/null; then
 	echo "vzdump is not installed. Exiting..."
 	exit 1
 fi
-
-# Function to perform backup
-backup_container() {
-	local container_id=$1
-	vzdump $container_id --dumpdir $LOCAL_BACKUP_DIR --mode snapshot --compress $COMPRESSION --mailto "$EMAIL_RECIPIENT"
-	return $?
-}
-
-# Function to clean old backups for a specific container
-clean_old_backups() {
-	local container_id=$1
-	find $TARGET_BACKUP_DIR -type f -name "vzdump-lxc-$container_id-*.tar" -o -name "vzdump-lxc-$container_id-*.tar.gz" -o -name "vzdump-lxc-$container_id-*.lzo" -o -name "vzdump-lxc-$container_id-*.vma" -o -name "vzdump-lxc-$container_id-*.log" -mtime +$DAYS_TO_KEEP -exec rm -f {} \;
-}
 
 # Backup each container and handle relevant files
 for container_id in "${CONTAINER_LIST[@]}"; do
