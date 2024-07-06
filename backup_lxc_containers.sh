@@ -20,6 +20,7 @@ LOCAL_BACKUP_DIR=${LOCAL_BACKUP_DIR:-/var/lib/vz/dump}
 TARGET_BACKUP_DIR=${TARGET_BACKUP_DIR:-$LOCAL_BACKUP_DIR}
 BACKUP_SUCCESS=true
 EMAIL_RECIPIENT=${EMAIL_RECIPIENT:-root}
+COMPRESSION=${COMPRESSION:-gzip}
 
 # Check if target backup directory is mounted
 if [ "$TARGET_BACKUP_DIR" != "$LOCAL_BACKUP_DIR" ]; then
@@ -44,7 +45,7 @@ fi
 # Function to perform backup
 backup_container() {
 	local container_id=$1
-	vzdump $container_id --dumpdir $LOCAL_BACKUP_DIR --mode snapshot --compress gzip --mailto "$EMAIL_RECIPIENT"
+	vzdump $container_id --dumpdir $LOCAL_BACKUP_DIR --mode snapshot --compress $COMPRESSION --mailto "$EMAIL_RECIPIENT"
 	return $?
 }
 

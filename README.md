@@ -47,6 +47,7 @@ cd backup-lxc-containers
    - `CONTAINERS`: Comma-separated list of container IDs to back up.
    - `DAYS_TO_KEEP`: Number of days to retain backups (default is 7).
    - `EMAIL_RECIPIENT`: Email address to notify upon successful backups.
+   - `COMPRESSION`: Compression used for the backup.
 
 2. **Make the Script Executable:**
 
@@ -90,6 +91,7 @@ TARGET_BACKUP_DIR="/mnt/backup-target"
 CONTAINERS="102,103"
 DAYS_TO_KEEP=7
 EMAIL_RECIPIENT="your-email@example.com"
+COMPRESSION="zst"
 ```
 
 Run the script manually:
@@ -108,6 +110,7 @@ TARGET_BACKUP_DIR="/mnt/backup-target"
 CONTAINERS="104,105,106"
 DAYS_TO_KEEP=5
 EMAIL_RECIPIENT="admin@example.com"
+COMPRESSION="gzip"
 ```
 
 Schedule the script to run daily at 3 AM:
