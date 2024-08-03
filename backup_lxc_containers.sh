@@ -54,9 +54,9 @@ clean_old_backups() {
 	local container_id=$1
 
 	# Output for debugging
-	echo "find $TARGET_BACKUP_DIR -type f -name 'vzdump-lxc-$container_id-*.tar' -o -name 'vzdump-lxc-$container_id-*.tar.gz' -o -name 'vzdump-lxc-$container_id-*.lzo' -o -name 'vzdump-lxc-$container_id-*.vma' -o -name 'vzdump-lxc-$container_id-*.log' -mtime +$DAYS_TO_KEEP -exec rm -f {} \;"
+	echo "find $TARGET_BACKUP_DIR -type f \( -name "vzdump-lxc-$container_id-*.tar" -o -name "vzdump-lxc-$container_id-*.tar.gz" -o -name "vzdump-lxc-$container_id-*.lzo" -o -name "vzdump-lxc-$container_id-*.zst" -o -name "vzdump-lxc-$container_id-*.vma" -o -name "vzdump-lxc-$container_id-*.log" \) -mtime +$DAYS_TO_KEEP -exec rm -f {} \;"
 
-	find $TARGET_BACKUP_DIR -type f -name "vzdump-lxc-$container_id-*.tar" -o -name "vzdump-lxc-$container_id-*.tar.gz" -o -name "vzdump-lxc-$container_id-*.lzo" -o -name "vzdump-lxc-$container_id-*.vma" -o -name "vzdump-lxc-$container_id-*.log" -mtime +$DAYS_TO_KEEP -exec rm -f {} \;
+	find $TARGET_BACKUP_DIR -type f \( -name "vzdump-lxc-$container_id-*.tar" -o -name "vzdump-lxc-$container_id-*.tar.gz" -o -name "vzdump-lxc-$container_id-*.lzo" -o -name "vzdump-lxc-$container_id-*.zst" -o -name "vzdump-lxc-$container_id-*.vma" -o -name "vzdump-lxc-$container_id-*.log" \) -mtime +$DAYS_TO_KEEP -exec rm -f {} \;
 }
 
 # Function to restart container
