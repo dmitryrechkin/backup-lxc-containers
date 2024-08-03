@@ -50,10 +50,29 @@ backup_container() {
 
 # Function to clean old backups for a specific container
 clean_old_backups() {
+	echo "Cleaning old backups for container $container_id..."
 	local container_id=$1
+
+	# Output for debugging
+	echo "find $TARGET_BACKUP_DIR -type f -name 'vzdump-lxc-$container_id-*.tar' -o -name 'vzdump-lxc-$container_id-*.tar.gz' -o -name 'vzdump-lxc-$container_id-*.lzo' -o -name 'vzdump-lxc-$container_id-*.vma' -o -name 'vzdump-lxc-$container_id-*.log' -mtime +$DAYS_TO_KEEP -exec rm -f {} \;"
+
 	find $TARGET_BACKUP_DIR -type f -name "vzdump-lxc-$container_id-*.tar" -o -name "vzdump-lxc-$container_id-*.tar.gz" -o -name "vzdump-lxc-$container_id-*.lzo" -o -name "vzdump-lxc-$container_id-*.vma" -o -name "vzdump-lxc-$container_id-*.log" -mtime +$DAYS_TO_KEEP -exec rm -f {} \;
 }
 
+# Function to restart container
+restart_container() {
+	local container_id=$1
+	echo "Restart $container_id container to fix possible issues..."
+	/usr/sbin/pct stop $container_id
+	/usr/sbin/pct start $container_id
+}
+
+# Function to move backups to target backup directory
+move_to_target_backup_dir() {
+	local container_id=$1
+	echo "Moving $container_id backups to target backup directory..."
+	mv $LOCAL_BACKUP_DIR/vzdump-lxc-$container_id-* $TARGET_BACKUP_DIR/
+}
 
 # Check if target backup directory is mounted, if required
 if [ "$CHECK_MOUNTPOINT" = true ] && [ "$TARGET_BACKUP_DIR" != "$LOCAL_BACKUP_DIR" ]; then
@@ -79,13 +98,8 @@ fi
 for container_id in "${CONTAINER_LIST[@]}"; do
 	backup_container $container_id
 	if [ $? -eq 0 ]; then
-		# Sometimes backup can corrupt state of the container, so restart it to fix possible issues
-		echo "Restart container to fix possible issues..."
-		pct stop $container_id
-		pct start $container_id
-
-		echo "Backup successful for container $container_id. Moving to target backup folder and cleaning old backups..."
-		mv $LOCAL_BACKUP_DIR/vzdump-lxc-$container_id-* $TARGET_BACKUP_DIR/
+		restart_container $container_id
+		move_to_target_backup_dir $container_id
 		clean_old_backups $container_id
 	else
 		echo "Backup failed for container $container_id."
