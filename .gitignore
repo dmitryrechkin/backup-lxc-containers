@@ -1,0 +1,12 @@
+# Environment configuration files
+.env
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# Local configuration
+config.local
