@@ -135,6 +135,9 @@ if ! command -v vzdump &> /dev/null; then
 	exit 1
 fi
 
+# Send startup notification
+echo "Backup process started at $(date)" | mail -s "Proxmox Backup Started - Containers: ${CONTAINERS}" "$EMAIL_RECIPIENT"
+
 # Backup each container and handle relevant files
 for container_id in "${CONTAINER_LIST[@]}"; do
 	backup_container $container_id
@@ -155,6 +158,8 @@ done
 
 if $BACKUP_SUCCESS; then
 	echo "All backups completed successfully."
+	echo "All container backups completed successfully at $(date). Backups saved to S3 storage." | mail -s "Proxmox Backup SUCCESS - Containers: ${CONTAINERS}" "$EMAIL_RECIPIENT"
 else
 	echo "Some backups failed."
+	echo "Backup process completed with ERRORS at $(date). Check logs for details." | mail -s "Proxmox Backup FAILED - Containers: ${CONTAINERS}" "$EMAIL_RECIPIENT"
 fi
