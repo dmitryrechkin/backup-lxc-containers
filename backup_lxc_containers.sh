@@ -41,11 +41,42 @@ check_mount_point() {
 	return 1
 }
 
-# Function to perform backup
+# Function to perform backup with timeout
 backup_container() {
 	local container_id=$1
-	vzdump $container_id --dumpdir $LOCAL_BACKUP_DIR --mode snapshot --compress $COMPRESSION --mailto "$EMAIL_RECIPIENT"
-	return $?
+	echo "Starting backup for container $container_id..."
+	
+	# Check container status before backup
+	local was_running=$(pct status $container_id | grep -c "running")
+	
+	timeout 10800 vzdump $container_id --dumpdir $LOCAL_BACKUP_DIR --mode snapshot --compress $COMPRESSION --mailto "$EMAIL_RECIPIENT"
+	local result=$?
+	
+	# Always unlock container first
+	echo "Unlocking container $container_id..."
+	pct unlock $container_id 2>/dev/null || true
+	
+	# Ensure container is running after backup if it was running before
+	if [ $was_running -gt 0 ]; then
+		echo "Ensuring container $container_id is running..."
+		pct start $container_id 2>/dev/null || true
+		
+		# Verify it actually started
+		sleep 5
+		local is_running=$(pct status $container_id | grep -c "running")
+		if [ $is_running -eq 0 ]; then
+			echo "WARNING: Failed to start container $container_id after backup"
+		else
+			echo "Container $container_id is running successfully"
+		fi
+	fi
+	
+	if [ $result -eq 124 ]; then
+		echo "Backup timed out after 3 hours for container $container_id"
+		return 1
+	fi
+	
+	return $result
 }
 
 # Function to clean old backups for a specific container
@@ -71,7 +102,17 @@ restart_container() {
 move_to_target_backup_dir() {
 	local container_id=$1
 	echo "Moving $container_id backups to target backup directory..."
-	mv $LOCAL_BACKUP_DIR/vzdump-lxc-$container_id-* $TARGET_BACKUP_DIR/
+	
+	# Find backup files for this container from today
+	local backup_files=$(find $LOCAL_BACKUP_DIR -name "vzdump-lxc-$container_id-*" -newermt "$(date +%Y-%m-%d)" -type f)
+	
+	if [ -n "$backup_files" ]; then
+		mv $backup_files $TARGET_BACKUP_DIR/
+		echo "Moved backup files for container $container_id"
+	else
+		echo "No backup files found for container $container_id to move"
+		return 1
+	fi
 }
 
 # Check if target backup directory is mounted, if required
@@ -99,8 +140,13 @@ for container_id in "${CONTAINER_LIST[@]}"; do
 	backup_container $container_id
 	if [ $? -eq 0 ]; then
 		restart_container $container_id
-		move_to_target_backup_dir $container_id
-		clean_old_backups $container_id
+		if move_to_target_backup_dir $container_id; then
+			clean_old_backups $container_id
+			echo "Backup completed successfully for container $container_id."
+		else
+			echo "Failed to move backup files for container $container_id."
+			BACKUP_SUCCESS=false
+		fi
 	else
 		echo "Backup failed for container $container_id."
 		BACKUP_SUCCESS=false
