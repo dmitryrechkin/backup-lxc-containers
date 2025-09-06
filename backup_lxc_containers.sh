@@ -220,13 +220,23 @@ backup_container() {
 		echo "Ensuring container $container_id is running..."
 		pct start $container_id 2>/dev/null || true
 		
-		# Verify it actually started
-		sleep 5
+		# Wait longer for proper startup and verify with deep health check
+		echo "Waiting 15 seconds for container $container_id services to initialize..."
+		sleep 15
+		
+		# Perform basic health verification
 		local is_running=$(pct status $container_id | grep -c "running")
 		if [ $is_running -eq 0 ]; then
-			echo "WARNING: Failed to start container $container_id after backup"
+			echo "ERROR: Container $container_id failed to start after backup"
+			return 1
+		fi
+		
+		# Test basic responsiveness
+		if timeout 10 pct exec $container_id -- echo "health_test" >/dev/null 2>&1; then
+			echo "Container $container_id is running and responsive"
 		else
-			echo "Container $container_id is running successfully"
+			echo "WARNING: Container $container_id is running but not responsive - may need manual intervention"
+			return 1
 		fi
 	fi
 	
@@ -468,15 +478,8 @@ for container_id in "${CONTAINER_LIST[@]}"; do
 	if backup_container $container_id; then
 		echo "Backup completed for container $container_id"
 		
-		# Check if restart is needed, only restart if necessary
-		if check_container_needs_restart $container_id; then
-			echo "Container $container_id needs restart after backup"
-			restart_container $container_id
-		else
-			echo "Container $container_id is healthy, skipping unnecessary restart"
-		fi
-		
-		# Ensure container is running before moving files to S3
+		# The backup_container function already handles container restart if needed
+		# Just verify container is healthy before proceeding with S3 upload
 		if ensure_container_running $container_id; then
 			echo "Container $container_id confirmed running, proceeding with S3 upload..."
 			
