@@ -272,6 +272,46 @@ restart_container() {
 	/usr/sbin/pct start $container_id
 }
 
+# Function to ensure container is running with retries
+ensure_container_running() {
+	local container_id=$1
+	local max_retries=3
+	local retry_count=0
+	
+	if [ "$DRY_RUN" = true ]; then
+		echo "[DRY RUN] Would ensure container $container_id is running"
+		return 0
+	fi
+	
+	while [ $retry_count -lt $max_retries ]; do
+		echo "Checking if container $container_id is running (attempt $((retry_count + 1))/$max_retries)..."
+		
+		local status=$(pct status $container_id 2>/dev/null | awk '{print $2}')
+		if [[ "$status" == "running" ]]; then
+			# Verify we can actually access the container
+			if timeout 10 pct exec $container_id -- echo "test" >/dev/null 2>&1; then
+				echo "Container $container_id is running and accessible"
+				return 0
+			else
+				echo "Container $container_id appears running but not accessible"
+			fi
+		else
+			echo "Container $container_id status: $status"
+		fi
+		
+		# Try to start the container
+		echo "Starting container $container_id..."
+		pct start $container_id 2>/dev/null || true
+		
+		# Wait a bit and check again
+		sleep 10
+		retry_count=$((retry_count + 1))
+	done
+	
+	echo "CRITICAL: Failed to ensure container $container_id is running after $max_retries attempts"
+	return 1
+}
+
 # Function to move backups to target backup directory
 move_to_target_backup_dir() {
 	local container_id=$1
@@ -346,16 +386,49 @@ for container_id in "${CONTAINER_LIST[@]}"; do
 		echo "Backup completed for container $container_id"
 		restart_container $container_id
 		
-		# Use the new S3 verification function instead of simple move
-		if verify_and_retry_s3_upload $container_id; then
-			clean_old_backups $container_id
-			echo "Backup completed successfully for container $container_id."
+		# Ensure container is running before moving files to S3
+		if ensure_container_running $container_id; then
+			echo "Container $container_id confirmed running, proceeding with S3 upload..."
+			
+			# Use the new S3 verification function instead of simple move
+			if verify_and_retry_s3_upload $container_id; then
+				clean_old_backups $container_id
+				echo "Backup completed successfully for container $container_id."
+			else
+				echo "Failed to upload backup files for container $container_id to S3."
+				
+				# Send S3 failure email immediately
+				if [ "$DRY_RUN" != true ]; then
+					echo "S3 UPLOAD FAILURE: Backup for container $container_id completed successfully but failed to upload to S3 after multiple retries on node $(hostname) at $(date). Backup files are available locally: $LOCAL_BACKUP_DIR" | mail -s "S3 Upload Failed - $container_id on $(hostname)" "$EMAIL_RECIPIENT"
+				else
+					echo "[DRY RUN] Would send email about S3 upload failure"
+				fi
+				
+				BACKUP_SUCCESS=false
+			fi
 		else
-			echo "Failed to upload backup files for container $container_id to S3."
+			echo "CRITICAL: Container $container_id failed to start properly after backup!"
+			echo "Skipping S3 upload for container $container_id due to startup failure."
+			
+			# Send critical failure email immediately
+			if [ "$DRY_RUN" != true ]; then
+				echo "CRITICAL FAILURE: Container $container_id failed to start after backup on node $(hostname) at $(date). Manual intervention required. Backup files are available locally but not uploaded to S3." | mail -s "CRITICAL: Container Startup Failed - $container_id on $(hostname)" "$EMAIL_RECIPIENT"
+			else
+				echo "[DRY RUN] Would send CRITICAL email about container startup failure"
+			fi
+			
 			BACKUP_SUCCESS=false
 		fi
 	else
 		echo "Backup failed for container $container_id."
+		
+		# Send backup failure email immediately
+		if [ "$DRY_RUN" != true ]; then
+			echo "BACKUP FAILURE: Backup process failed for container $container_id on node $(hostname) at $(date). Check logs for details." | mail -s "Backup Failed - $container_id on $(hostname)" "$EMAIL_RECIPIENT"
+		else
+			echo "[DRY RUN] Would send email about backup process failure"
+		fi
+		
 		BACKUP_SUCCESS=false
 	fi
 	
