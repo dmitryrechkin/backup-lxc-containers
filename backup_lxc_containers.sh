@@ -1,5 +1,22 @@
 #!/bin/bash
 
+# HA-Aware Proxmox Container Backup Script
+# 
+# IMPORTANT - Bash Return Code Convention:
+# All functions in this script follow standard Unix/Bash return code semantics:
+# - Return 0 = SUCCESS/TRUE (operation succeeded, condition is true)
+# - Return 1 = FAILURE/FALSE (operation failed, condition is false)
+# 
+# This is the opposite of mathematical boolean logic but follows Unix tradition
+# where programs exit with 0 for "everything went fine" and non-zero for errors.
+#
+# Examples:
+# - is_container_healthy() returns 0 if healthy, 1 if unhealthy
+# - backup_container() returns 0 if backup succeeded, 1 if failed
+# - Usage: if is_container_healthy $id; then echo "healthy"; fi
+#
+# When in doubt: 0 = good/success/true, 1 = bad/failure/false
+
 # Parse command line arguments
 for arg in "$@"; do
 	case $arg in
@@ -64,6 +81,7 @@ check_mount_point() {
 }
 
 # Function to check if container is running locally (HA-aware)
+# Returns: 0 if container is local/accessible, 1 if not local/not accessible
 is_container_local() {
 	local container_id=$1
 	
@@ -94,7 +112,8 @@ is_container_local() {
 	fi
 }
 
-# Function to check if backup already exists in S3 for today
+# Function to check if backup already exists in S3 for today  
+# Returns: 0 if backup exists (skip backup), 1 if no backup exists (proceed)
 backup_exists_today() {
 	local container_id=$1
 	local today=$(date +%Y-%m-%d)
@@ -110,6 +129,7 @@ backup_exists_today() {
 }
 
 # Function to create backup lock file
+# Returns: 0 if lock created successfully, 1 if lock already exists or failed
 create_backup_lock() {
 	local container_id=$1
 	local lock_file="/tmp/backup-${container_id}.lock"
@@ -194,6 +214,7 @@ verify_and_retry_s3_upload() {
 }
 
 # Function to perform backup with timeout
+# Returns: 0 if backup completed successfully, 1 if backup failed
 backup_container() {
 	local container_id=$1
 	echo "Starting backup for container $container_id..."
@@ -533,17 +554,31 @@ for container_id in "${CONTAINER_LIST[@]}"; do
 	
 	echo "Starting backup process for container $container_id..."
 	
+	# Check if container was running before backup
+	local was_running=$(pct status $container_id 2>/dev/null | grep -c "running")
+	echo "Container $container_id initial state: $([ $was_running -gt 0 ] && echo "running" || echo "stopped")"
+	
 	# Perform the backup
 	if backup_container $container_id; then
 		echo "Backup completed for container $container_id"
 		
-		# The backup_container function already handles container restart if needed
-		# Just verify container is healthy before proceeding with S3 upload
-		if ensure_container_running $container_id; then
-			echo "Container $container_id confirmed running, proceeding with S3 upload..."
-			
-			# Use the new S3 verification function instead of simple move
-			if verify_and_retry_s3_upload $container_id; then
+		# Only check health if container was originally running
+		if [ $was_running -gt 0 ]; then
+			if ensure_container_health_after_backup $container_id; then
+				echo "Container $container_id confirmed healthy, proceeding with S3 upload..."
+			else
+				echo "CRITICAL: Container $container_id failed health check after backup"
+				BACKUP_SUCCESS=false
+				# Always remove lock even on failure
+				remove_backup_lock $container_id
+				continue
+			fi
+		else
+			echo "Container $container_id was stopped before backup, leaving stopped"
+		fi
+		
+		# Proceed with S3 upload
+		if verify_and_retry_s3_upload $container_id; then
 				clean_old_backups $container_id
 				echo "Backup completed successfully for container $container_id."
 			else
