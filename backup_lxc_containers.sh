@@ -220,24 +220,83 @@ backup_container() {
 		echo "Ensuring container $container_id is running..."
 		pct start $container_id 2>/dev/null || true
 		
-		# Wait longer for proper startup and verify with deep health check
-		echo "Waiting 15 seconds for container $container_id services to initialize..."
-		sleep 15
+		# Generic container health validation - works for any container type
+		echo "Performing generic health validation for container $container_id..."
 		
-		# Perform basic health verification
+		# Stage 1: Basic container status
 		local is_running=$(pct status $container_id | grep -c "running")
 		if [ $is_running -eq 0 ]; then
 			echo "ERROR: Container $container_id failed to start after backup"
 			return 1
 		fi
 		
-		# Test basic responsiveness
-		if timeout 10 pct exec $container_id -- echo "health_test" >/dev/null 2>&1; then
-			echo "Container $container_id is running and responsive"
-		else
-			echo "WARNING: Container $container_id is running but not responsive - may need manual intervention"
+		# Stage 2: Command execution test (immediate)
+		if ! timeout 10 pct exec $container_id -- echo "basic_test" >/dev/null 2>&1; then
+			echo "ERROR: Container $container_id cannot execute basic commands"
 			return 1
 		fi
+		
+		# Stage 3: Wait for services to initialize (generic timing)
+		echo "Waiting 30 seconds for container $container_id services to initialize..."
+		sleep 30
+		
+		# Stage 4: Process health validation (universal)
+		echo "Validating process health..."
+		local process_count=$(timeout 15 pct exec $container_id -- ps aux 2>/dev/null | wc -l)
+		if [ -z "$process_count" ] || [ "$process_count" -lt 3 ]; then
+			echo "ERROR: Container $container_id has critical process count issue ($process_count processes)"
+			return 1
+		fi
+		
+		# Stage 5: System resource validation (universal)
+		echo "Checking system responsiveness..."
+		local load_avg=$(timeout 10 pct exec $container_id -- cat /proc/loadavg 2>/dev/null | awk '{print $1}')
+		if [ -z "$load_avg" ]; then
+			echo "ERROR: Container $container_id system not responding to resource queries"
+			return 1
+		fi
+		
+		# Stage 6: Network stack validation (universal)
+		echo "Testing network stack..."
+		if ! timeout 10 pct exec $container_id -- ip link show 2>/dev/null | grep -q "state UP"; then
+			echo "WARNING: Container $container_id network interfaces may have issues"
+		fi
+		
+		# Stage 7: Service port detection and validation (generic)
+		echo "Detecting and validating active services..."
+		local listening_ports=$(timeout 10 pct exec $container_id -- netstat -ln 2>/dev/null | grep "LISTEN" | wc -l)
+		if [ "$listening_ports" -gt 0 ]; then
+			echo "Container $container_id has $listening_ports services listening"
+			
+			# Generic connectivity test - find any HTTP-like port and test it
+			local http_port=$(timeout 10 pct exec $container_id -- netstat -ln 2>/dev/null | grep "LISTEN" | grep -E ":(80|8080|443|8443)" | head -1 | sed 's/.*:\([0-9]*\).*/\1/')
+			if [ -n "$http_port" ]; then
+				echo "Testing HTTP-like service on port $http_port..."
+				if timeout 10 pct exec $container_id -- curl -f -s "http://localhost:$http_port/" >/dev/null 2>&1; then
+					echo "HTTP-like service on port $http_port is responding"
+				else
+					echo "INFO: HTTP-like service detected but may still be initializing"
+					# Give it more time and test once more
+					sleep 15
+					if timeout 10 pct exec $container_id -- curl -f -s "http://localhost:$http_port/" >/dev/null 2>&1; then
+						echo "HTTP-like service recovered and is responding"
+					else
+						echo "WARNING: HTTP-like service may need manual verification"
+					fi
+				fi
+			fi
+		else
+			echo "INFO: No listening services detected (may be expected for this container type)"
+		fi
+		
+		# Stage 8: Final responsiveness test
+		echo "Final responsiveness verification..."
+		if ! timeout 15 pct exec $container_id -- echo "final_test" >/dev/null 2>&1; then
+			echo "ERROR: Container $container_id failed final responsiveness test"
+			return 1
+		fi
+		
+		echo "Container $container_id passed all generic health validations"
 	fi
 	
 	if [ $result -eq 124 ]; then
