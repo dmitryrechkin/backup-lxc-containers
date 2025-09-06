@@ -272,6 +272,42 @@ restart_container() {
 	/usr/sbin/pct start $container_id
 }
 
+# Function to check if container needs restart after backup
+# Returns 0 if NO restart needed, 1 if restart needed
+check_container_needs_restart() {
+	local container_id=$1
+	
+	if [ "$DRY_RUN" = true ]; then
+		echo "[DRY RUN] Would check if container $container_id needs restart"
+		return 0  # In dry run, assume no restart needed
+	fi
+	
+	echo "Checking if container $container_id needs restart after backup..."
+	
+	# Check if container is running
+	local status=$(pct status $container_id 2>/dev/null | awk '{print $2}')
+	if [[ "$status" != "running" ]]; then
+		echo "Container $container_id is not running (status: $status) - restart needed"
+		return 1  # Return 1 = restart needed
+	fi
+	
+	# Test basic responsiveness - can we execute commands?
+	if ! timeout 10 pct exec $container_id -- echo "test" >/dev/null 2>&1; then
+		echo "Container $container_id is not responsive - restart needed"
+		return 1  # Return 1 = restart needed
+	fi
+	
+	# Check if container processes are healthy
+	local process_count=$(timeout 10 pct exec $container_id -- ps aux 2>/dev/null | wc -l)
+	if [ "$process_count" -lt 10 ]; then
+		echo "Container $container_id has suspiciously few processes ($process_count) - restart needed"
+		return 1  # Return 1 = restart needed
+	fi
+	
+	echo "Container $container_id appears healthy - no restart needed"
+	return 0  # Return 0 = no restart needed
+}
+
 # Function to ensure container is running with retries
 ensure_container_running() {
 	local container_id=$1
@@ -384,7 +420,14 @@ for container_id in "${CONTAINER_LIST[@]}"; do
 	# Perform the backup
 	if backup_container $container_id; then
 		echo "Backup completed for container $container_id"
-		restart_container $container_id
+		
+		# Check if restart is needed, only restart if necessary
+		if check_container_needs_restart $container_id; then
+			echo "Container $container_id needs restart after backup"
+			restart_container $container_id
+		else
+			echo "Container $container_id is healthy, skipping unnecessary restart"
+		fi
 		
 		# Ensure container is running before moving files to S3
 		if ensure_container_running $container_id; then
