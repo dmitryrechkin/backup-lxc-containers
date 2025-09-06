@@ -308,28 +308,70 @@ check_container_needs_restart() {
 	return 0  # Return 0 = no restart needed
 }
 
-# Function to ensure container is running with retries
+# Function to perform deep health check on container
+deep_health_check() {
+	local container_id=$1
+	
+	if [ "$DRY_RUN" = true ]; then
+		echo "[DRY RUN] Would perform deep health check on container $container_id"
+		return 0
+	fi
+	
+	echo "Performing deep health check on container $container_id..."
+	
+	# Basic command execution test
+	if ! timeout 15 pct exec $container_id -- echo "health_check" >/dev/null 2>&1; then
+		echo "Container $container_id failed basic command execution test"
+		return 1
+	fi
+	
+	# Check system load and responsiveness
+	local load_avg=$(timeout 10 pct exec $container_id -- cat /proc/loadavg 2>/dev/null | awk '{print $1}')
+	if [[ -z "$load_avg" ]]; then
+		echo "Container $container_id failed to report system load"
+		return 1
+	fi
+	
+	# Check if critical processes are running
+	local process_count=$(timeout 15 pct exec $container_id -- ps aux 2>/dev/null | wc -l)
+	if [ "$process_count" -lt 5 ]; then
+		echo "Container $container_id has too few processes ($process_count) - unhealthy"
+		return 1
+	fi
+	
+	# Check disk space inside container
+	local disk_usage=$(timeout 10 pct exec $container_id -- df / 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//')
+	if [[ "$disk_usage" -gt 95 ]]; then
+		echo "Container $container_id disk usage critical: ${disk_usage}%"
+		return 1
+	fi
+	
+	echo "Container $container_id passed deep health check"
+	return 0
+}
+
+# Function to ensure container is running with retries and deep health checks
 ensure_container_running() {
 	local container_id=$1
 	local max_retries=3
 	local retry_count=0
 	
 	if [ "$DRY_RUN" = true ]; then
-		echo "[DRY RUN] Would ensure container $container_id is running"
+		echo "[DRY RUN] Would ensure container $container_id is running with deep health checks"
 		return 0
 	fi
 	
 	while [ $retry_count -lt $max_retries ]; do
-		echo "Checking if container $container_id is running (attempt $((retry_count + 1))/$max_retries)..."
+		echo "Verifying container $container_id health (attempt $((retry_count + 1))/$max_retries)..."
 		
 		local status=$(pct status $container_id 2>/dev/null | awk '{print $2}')
 		if [[ "$status" == "running" ]]; then
-			# Verify we can actually access the container
-			if timeout 10 pct exec $container_id -- echo "test" >/dev/null 2>&1; then
-				echo "Container $container_id is running and accessible"
+			# Perform deep health check
+			if deep_health_check $container_id; then
+				echo "Container $container_id is running and healthy"
 				return 0
 			else
-				echo "Container $container_id appears running but not accessible"
+				echo "Container $container_id is running but failed health checks"
 			fi
 		else
 			echo "Container $container_id status: $status"
@@ -337,14 +379,19 @@ ensure_container_running() {
 		
 		# Try to start the container
 		echo "Starting container $container_id..."
-		pct start $container_id 2>/dev/null || true
+		if pct start $container_id 2>/dev/null; then
+			echo "Container $container_id start command succeeded, waiting for full startup..."
+		else
+			echo "Container $container_id start command failed"
+		fi
 		
-		# Wait a bit and check again
-		sleep 10
+		# Wait longer for full container initialization
+		echo "Waiting 30 seconds for container $container_id to fully initialize..."
+		sleep 30
 		retry_count=$((retry_count + 1))
 	done
 	
-	echo "CRITICAL: Failed to ensure container $container_id is running after $max_retries attempts"
+	echo "CRITICAL: Failed to ensure container $container_id is healthy after $max_retries attempts"
 	return 1
 }
 
@@ -478,6 +525,36 @@ for container_id in "${CONTAINER_LIST[@]}"; do
 	# Always remove the lock file
 	remove_backup_lock $container_id
 done
+
+# Final verification - ensure all backed up containers are healthy
+echo "Performing final health verification on all processed containers..."
+FINAL_VERIFICATION_FAILED=false
+
+for container_id in "${CONTAINER_LIST[@]}"; do
+	# Only verify containers that were processed on this node
+	if is_container_local $container_id; then
+		echo "Final verification for container $container_id..."
+		if [ "$DRY_RUN" = true ]; then
+			echo "[DRY RUN] Would perform final verification on container $container_id"
+		else
+			if ! deep_health_check $container_id; then
+				echo "CRITICAL: Final verification failed for container $container_id"
+				FINAL_VERIFICATION_FAILED=true
+				
+				# Send immediate critical alert for final verification failure
+				echo "FINAL VERIFICATION FAILURE: Container $container_id failed final health check after backup completion on node $(hostname) at $(date). Container may be in unstable state requiring immediate attention." | mail -s "CRITICAL: Final Verification Failed - $container_id on $(hostname)" "$EMAIL_RECIPIENT"
+			else
+				echo "Container $container_id passed final verification"
+			fi
+		fi
+	fi
+done
+
+# Update backup success status based on final verification
+if [ "$FINAL_VERIFICATION_FAILED" = true ]; then
+	echo "CRITICAL: Final verification failed for one or more containers"
+	BACKUP_SUCCESS=false
+fi
 
 if [ "$DRY_RUN" = true ]; then
 	echo "[DRY RUN] Analysis completed. No actual backups were performed."
