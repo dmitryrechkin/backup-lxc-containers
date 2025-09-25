@@ -342,34 +342,28 @@ backup_single_container() {
 	local overall_success=true
 	
 	echo "=== Starting backup cycle for container $container_id ==="
-	
-	# Step 1: Check if container runs locally on this HA node
-	# WHY: Only backup containers that are accessible from current node
-	if ! check_container_runs_locally $container_id; then
-		echo "Container $container_id not local to this node - skipping entirely"
-		return 1  # Not local - skip this container completely
-	fi
-	
+
+	# Note: Container locality check moved to main loop for cleaner success/failure logic
 	# Note: Removed "backup already exists today" check
 	# WHY: Multiple backups per day should be allowed for various reasons:
 	# - Before/after major changes, manual backup requests, retry after failures
 	# - Time-based backup names ensure uniqueness without blocking multiple backups
-	
-	# Step 3: Record container's initial state
+
+	# Step 1: Record container's initial state
 	# WHY: Must restore container to exact same state after backup
 	local initial_state=$(record_container_initial_state $container_id)
 	echo "Recorded initial state: $initial_state"
 	
-	# Step 4: Create backup lock file for node coordination
+	# Step 2: Create backup lock file for node coordination
 	# WHY: Prevent multiple nodes from backing up same container
 	if ! create_backup_lock_file $container_id; then
 		echo "Cannot create backup lock for container $container_id - skipping entirely"
 		return 1  # Lock conflict - skip this container completely
 	fi
 	
-	# Step 5: Execute the actual backup (CRITICAL - cannot continue without this)
+	# Step 3: Execute the actual backup (CRITICAL - cannot continue without this)
 	# WHY: This is the core operation - if this fails, nothing else matters
-	# Step 5a: Clean up any stale vzdump snapshots before backup
+	# Step 3a: Clean up any stale vzdump snapshots before backup
 	# WHY: Previous failed backups may leave stale ZFS snapshots that block new backups
 	echo "🧼 Cleaning up stale snapshots before backup..."
 	cleanup_stale_vzdump_snapshots $container_id
@@ -385,7 +379,7 @@ backup_single_container() {
 		return 1  # Cannot continue without backup file
 	fi
 	
-	# Step 6: Restore container to initial state (CRITICAL for running containers)
+	# Step 4: Restore container to initial state (CRITICAL for running containers)
 	# WHY: Running containers must be restored to working state, but this shouldn't stop S3 upload
 	echo "🔄 Restoring container to initial state: $initial_state"
 	if ensure_container_matches_initial_state $container_id $initial_state; then
@@ -397,7 +391,7 @@ backup_single_container() {
 		overall_success=false  # Mark as partial failure but continue
 	fi
 	
-	# Step 7: Upload backup files to S3 storage (IMPORTANT but independent of container state)
+	# Step 5: Upload backup files to S3 storage (IMPORTANT but independent of container state)
 	# WHY: Even if container health failed, we should still save the backup file to S3
 	echo "☁️ Uploading backup files to S3..."
 	if verify_and_retry_s3_upload $container_id; then
@@ -409,7 +403,7 @@ backup_single_container() {
 		overall_success=false  # Mark as partial failure but continue
 	fi
 	
-	# Step 8: Clean up old backup files (NON-CRITICAL)
+	# Step 6: Clean up old backup files (NON-CRITICAL)
 	# WHY: Cleanup failure should never affect overall backup success
 	echo "🧹 Cleaning up old backup files..."
 	if cleanup_old_backup_files $container_id; then
@@ -418,7 +412,7 @@ backup_single_container() {
 		echo "⚠️ WARNING: Old backup cleanup had issues (non-critical)"
 	fi
 	
-	# Step 9: Always remove backup lock file
+	# Step 7: Always remove backup lock file
 	# WHY: Lock cleanup must always happen regardless of other step results
 	remove_backup_lock_file $container_id
 	echo "🔓 Backup lock removed"
@@ -526,7 +520,15 @@ verify_and_retry_s3_upload() {
 	local backup_files=$(find $LOCAL_BACKUP_DIR -name "vzdump-lxc-$container_id-*" -newermt "$(date +%Y-%m-%d)" -type f)
 	local max_retries=3
 	local retry_count=0
-	
+
+	# Handle dry run mode first
+	if [ "$DRY_RUN" = true ]; then
+		echo "[DRY RUN] Would find backup files: vzdump-lxc-$container_id-* from today"
+		echo "[DRY RUN] Would move files to $TARGET_BACKUP_DIR/"
+		echo "[DRY RUN] Would verify files in S3"
+		return 0
+	fi
+
 	if [ -z "$backup_files" ]; then
 		echo "No backup files found for container $container_id"
 		return 1
@@ -536,11 +538,6 @@ verify_and_retry_s3_upload() {
 		echo "Attempting to move backup files to S3 (attempt $((retry_count + 1))/$max_retries)..."
 		
 		# Try to move files
-		if [ "$DRY_RUN" = true ]; then
-			echo "[DRY RUN] Would move files: $backup_files to $TARGET_BACKUP_DIR/"
-			echo "[DRY RUN] Would verify files in S3"
-			return 0
-		fi
 		
 		if mv $backup_files $TARGET_BACKUP_DIR/; then
 			# Verify files actually exist in S3
@@ -619,7 +616,13 @@ echo "Starting backup process for containers: ${CONTAINER_LIST[*]}"
 
 for container_id in "${CONTAINER_LIST[@]}"; do
 	echo -e "\n=== Processing container $container_id ==="
-	
+
+	# First check if container runs locally before attempting backup
+	if ! check_container_runs_locally $container_id; then
+		echo "ℹ️ Container $container_id not on this node - skipping (not a failure)"
+		continue
+	fi
+
 	# Call the single backup function that handles everything with internal step-specific retries
 	# WHY: Each critical step (S3 upload, health checks) has its own retry logic built-in
 	if backup_single_container $container_id; then
@@ -657,7 +660,11 @@ done
 
 if [ "$DRY_RUN" = true ]; then
 	echo "[DRY RUN] Analysis completed. No actual backups were performed."
-	echo "[DRY RUN] Would send completion email based on results."
+	if $BACKUP_SUCCESS; then
+		echo "[DRY RUN] Would send SUCCESS email: All local backups completed successfully on $(hostname)"
+	else
+		echo "[DRY RUN] Would send FAILED email: Some backups failed on $(hostname)"
+	fi
 else
 	if $BACKUP_SUCCESS; then
 		echo "All local backups completed successfully on $(hostname)."
