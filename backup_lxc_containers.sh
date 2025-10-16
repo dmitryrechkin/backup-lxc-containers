@@ -488,25 +488,47 @@ cleanup_stale_vzdump_snapshots() {
 # Returns: 0 if cleanup completed, 1 if cleanup failed
 cleanup_old_backup_files() {
 	local container_id=$1
+	local current_date=$(date +%Y_%m_%d)
+	local cutoff_date=$(date -d "$DAYS_TO_KEEP days ago" +%Y_%m_%d)
+	
+	echo "Cleaning old backups for container $container_id (keeping $DAYS_TO_KEEP days, cutoff date: $cutoff_date)..."
+	
+	# Find backup files for this container
+	local cleanup_result=0
+	local files_deleted=0
+	
+	for file in $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.tar $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.tar.gz $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.lzo $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.zst $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.vma $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.log; do
+		# Skip if file doesn't exist (glob didn't match)
+		[ -f "$file" ] || continue
+		
+		# Extract date from filename (format: vzdump-lxc-ID-YYYY_MM_DD-HH_MM_SS.ext)
+		local filename=$(basename "$file")
+		if [[ $filename =~ vzdump-lxc-$container_id-([0-9]{4}_[0-9]{2}_[0-9]{2})-.*\.(tar|tar\.gz|lzo|zst|vma|log) ]]; then
+			local backup_date="${BASH_REMATCH[1]}"
+			
+			# Compare dates (string comparison works for YYYY_MM_DD format)
+			if [[ "$backup_date" < "$cutoff_date" ]]; then
+				if [ "$DRY_RUN" = true ]; then
+					echo "[DRY RUN] Would remove old backup: $file (date: $backup_date)"
+				else
+					echo "Removing old backup: $filename (date: $backup_date)"
+					if rm -f "$file" 2>/dev/null; then
+						files_deleted=$((files_deleted + 1))
+					else
+						echo "WARNING: Failed to remove $file"
+						cleanup_result=1
+					fi
+				fi
+			fi
+		fi
+	done
 	
 	if [ "$DRY_RUN" = true ]; then
-		echo "[DRY RUN] Would clean old backups for container $container_id older than $DAYS_TO_KEEP days"
-		# Show what would be deleted in dry run
-		find $TARGET_BACKUP_DIR -type f \( -name "vzdump-lxc-$container_id-*.tar" -o -name "vzdump-lxc-$container_id-*.tar.gz" -o -name "vzdump-lxc-$container_id-*.lzo" -o -name "vzdump-lxc-$container_id-*.zst" -o -name "vzdump-lxc-$container_id-*.vma" -o -name "vzdump-lxc-$container_id-*.log" \) -mtime +$DAYS_TO_KEEP 2>/dev/null | while read file; do
-			echo "[DRY RUN] Would remove old backup: $file"
-		done
 		return 0  # Success in dry run mode
 	fi
 	
-	echo "Cleaning old backups for container $container_id (keeping $DAYS_TO_KEEP days)..."
-	
-	# Find and remove backup files older than retention period
-	# WHY: Multiple file extensions supported as vzdump can create different formats
-	local cleanup_result=0
-	find $TARGET_BACKUP_DIR -type f \( -name "vzdump-lxc-$container_id-*.tar" -o -name "vzdump-lxc-$container_id-*.tar.gz" -o -name "vzdump-lxc-$container_id-*.lzo" -o -name "vzdump-lxc-$container_id-*.zst" -o -name "vzdump-lxc-$container_id-*.vma" -o -name "vzdump-lxc-$container_id-*.log" \) -mtime +$DAYS_TO_KEEP -delete 2>/dev/null || cleanup_result=1
-	
 	if [ $cleanup_result -eq 0 ]; then
-		echo "Successfully cleaned old backups for container $container_id"
+		echo "Successfully cleaned old backups for container $container_id (deleted $files_deleted files)"
 		return 0  # Cleanup successful
 	else
 		echo "WARNING: Some old backup files for container $container_id could not be removed"
