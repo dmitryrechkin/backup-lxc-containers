@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HA-Aware Proxmox Container Backup Script
+# HA-Aware Proxmox Guest Backup Script
 # 
 # IMPORTANT - Bash Return Code Convention:
 # All functions in this script follow standard Unix/Bash return code semantics:
@@ -62,6 +62,143 @@ COMPRESSION=${COMPRESSION:-gzip}
 CHECK_MOUNTPOINT=${CHECK_MOUNTPOINT:-false}
 DRY_RUN=${DRY_RUN:-false}
 
+get_guest_type() {
+	local guest_id=$1
+
+	if pct config "$guest_id" >/dev/null 2>&1; then
+		echo "lxc"
+		return 0
+	fi
+
+	if qm config "$guest_id" >/dev/null 2>&1; then
+		echo "qemu"
+		return 0
+	fi
+
+	return 1
+}
+
+get_backup_prefix() {
+	local guest_type=$1
+
+	case "$guest_type" in
+		lxc) echo "vzdump-lxc" ;;
+		qemu) echo "vzdump-qemu" ;;
+		*) return 1 ;;
+	esac
+}
+
+get_guest_cluster_node() {
+	local guest_id=$1
+
+	python3 - "$guest_id" <<'PY'
+import json
+import subprocess
+import sys
+
+guest_id = sys.argv[1]
+try:
+    raw = subprocess.check_output(
+        ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
+        text=True,
+    )
+except subprocess.CalledProcessError:
+    sys.exit(1)
+
+for item in json.loads(raw):
+    if str(item.get("vmid")) == guest_id:
+        print(item.get("node", ""))
+        break
+PY
+}
+
+guest_config_exists_locally() {
+	local guest_id=$1
+	local guest_type=$2
+
+	case "$guest_type" in
+		lxc) pct config "$guest_id" >/dev/null 2>&1 ;;
+		qemu) qm config "$guest_id" >/dev/null 2>&1 ;;
+		*) return 1 ;;
+	esac
+}
+
+get_guest_status() {
+	local guest_id=$1
+	local guest_type=$2
+
+	case "$guest_type" in
+		lxc) pct status "$guest_id" 2>/dev/null | awk '{print $2}' ;;
+		qemu) qm status "$guest_id" 2>/dev/null | awk '{print $2}' ;;
+		*) return 1 ;;
+	esac
+}
+
+guest_is_command_accessible() {
+	local guest_id=$1
+	local guest_type=$2
+
+	case "$guest_type" in
+		lxc)
+			timeout 10 pct exec "$guest_id" -- echo "test" >/dev/null 2>&1
+			;;
+		qemu)
+			timeout 10 qm agent "$guest_id" ping >/dev/null 2>&1
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+guest_start() {
+	local guest_id=$1
+	local guest_type=$2
+
+	case "$guest_type" in
+		lxc) pct start "$guest_id" 2>/dev/null || true ;;
+		qemu) qm start "$guest_id" 2>/dev/null || true ;;
+	esac
+}
+
+guest_stop() {
+	local guest_id=$1
+	local guest_type=$2
+
+	case "$guest_type" in
+		lxc) pct stop "$guest_id" 2>/dev/null || true ;;
+		qemu) qm stop "$guest_id" 2>/dev/null || true ;;
+	esac
+}
+
+guest_unlock() {
+	local guest_id=$1
+	local guest_type=$2
+
+	case "$guest_type" in
+		lxc) pct unlock "$guest_id" 2>/dev/null || true ;;
+		qemu) qm unlock "$guest_id" 2>/dev/null || true ;;
+	esac
+}
+
+guest_process_count() {
+	local guest_id=$1
+	local guest_type=$2
+
+	case "$guest_type" in
+		lxc)
+			timeout 10 pct exec "$guest_id" -- ps aux 2>/dev/null | wc -l
+			;;
+		qemu)
+			# With qemu-guest-agent installed, a successful ping is good enough for this script.
+			echo 3
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
 # Function to check if any part of the path is a mount point
 check_mount_point() {
 	local path=$1
@@ -86,30 +223,47 @@ check_mount_point() {
 # Returns: 0 if container is local and accessible, 1 if not local or not accessible
 check_container_runs_locally() {
 	local container_id=$1
+	local guest_type
+	local status
+	local cluster_node
 	
-	# Check if container exists locally
-	if ! pct config $container_id >/dev/null 2>&1; then
-		echo "Container $container_id does not exist on this node"
+	guest_type="$(get_guest_type "$container_id")" || {
+		echo "Guest $container_id does not exist on this node"
+		return 1
+	}
+
+	if ! guest_config_exists_locally "$container_id" "$guest_type"; then
+		echo "Guest $container_id configuration is not available on this node"
 		return 1
 	fi
 	
 	# Get container status
-	local status=$(pct status $container_id 2>/dev/null | awk '{print $2}')
+	status="$(get_guest_status "$container_id" "$guest_type")"
+	cluster_node="$(get_guest_cluster_node "$container_id")"
 	
 	if [[ "$status" == "running" ]]; then
-		# Verify we can actually access the container (not just think it's running)
-		if timeout 10 pct exec $container_id -- echo "test" >/dev/null 2>&1; then
-			echo "Container $container_id is running locally on $(hostname)"
+		if [[ -n "$cluster_node" && "$cluster_node" != "$(hostname)" ]]; then
+			echo "Guest $container_id is running on $cluster_node, not $(hostname)"
+			return 1
+		fi
+
+		if guest_is_command_accessible "$container_id" "$guest_type"; then
+			echo "Guest $container_id ($guest_type) is running locally on $(hostname)"
 			return 0
 		else
-			echo "Container $container_id appears running but not accessible (likely on other node)"
+			echo "Guest $container_id ($guest_type) appears running but is not accessible"
 			return 1
 		fi
 	elif [[ "$status" == "stopped" ]]; then
-		echo "Container $container_id is stopped locally"
+		if [[ -n "$cluster_node" && "$cluster_node" != "$(hostname)" ]]; then
+			echo "Guest $container_id is registered to $cluster_node, not $(hostname)"
+			return 1
+		fi
+
+		echo "Guest $container_id ($guest_type) is stopped locally"
 		return 0
 	else
-		echo "Container $container_id status: $status (skipping - not local)"
+		echo "Guest $container_id ($guest_type) status: $status (skipping - not local)"
 		return 1
 	fi
 }
@@ -155,15 +309,17 @@ remove_backup_lock_file() {
 # Returns: Always returns 0 (success), outputs "running" or "stopped" to stdout
 record_container_initial_state() {
 	local container_id=$1
-	
+	local guest_type
+
 	# Check current container status
 	# WHY: This determines whether we need to restart container after backup
-	if pct status $container_id 2>/dev/null | grep -q "running"; then
+	guest_type="$(get_guest_type "$container_id")" || return 1
+	if [[ "$(get_guest_status "$container_id" "$guest_type")" == "running" ]]; then
 		echo "running"  # Output state to stdout for caller to capture
-		echo "Container $container_id initial state: RUNNING" >&2
+		echo "Guest $container_id initial state: RUNNING" >&2
 	else
 		echo "stopped"  # Output state to stdout for caller to capture
-		echo "Container $container_id initial state: STOPPED" >&2
+		echo "Guest $container_id initial state: STOPPED" >&2
 	fi
 	
 	return 0  # Always succeeds - we can always determine state
@@ -175,13 +331,16 @@ record_container_initial_state() {
 # Returns: 0 if backup completed successfully, 1 if backup failed or timed out
 execute_container_backup() {
 	local container_id=$1
+	local guest_type
+
+	guest_type="$(get_guest_type "$container_id")" || return 1
 	
 	if [ "$DRY_RUN" = true ]; then
 		echo "[DRY RUN] Would execute: timeout 10800 vzdump $container_id --dumpdir $LOCAL_BACKUP_DIR --mode snapshot --compress $COMPRESSION --mailto \"$EMAIL_RECIPIENT\""
 		return 0  # Success in dry run mode
 	fi
 	
-	echo "Executing backup for container $container_id..."
+	echo "Executing backup for guest $container_id ($guest_type)..."
 	
 	# Execute vzdump with 3-hour timeout (10800 seconds)
 	# WHY: Timeout prevents indefinitely hanging backups that could block the entire process
@@ -191,8 +350,8 @@ execute_container_backup() {
 	
 	# Always unlock container after backup operation
 	# WHY: vzdump may lock container during backup, unlock ensures container can be managed
-	echo "Unlocking container $container_id after backup..."
-	pct unlock $container_id 2>/dev/null || true
+	echo "Unlocking guest $container_id after backup..."
+	guest_unlock "$container_id" "$guest_type"
 	
 	# Analyze backup result
 	if [ $backup_result -eq 124 ]; then
@@ -214,6 +373,9 @@ execute_container_backup() {
 ensure_container_matches_initial_state() {
 	local container_id=$1
 	local initial_state=$2  # "running" or "stopped"
+	local guest_type
+
+	guest_type="$(get_guest_type "$container_id")" || return 1
 	
 	if [ "$DRY_RUN" = true ]; then
 		echo "[DRY RUN] Would ensure container $container_id matches initial state: $initial_state"
@@ -223,27 +385,27 @@ ensure_container_matches_initial_state() {
 	if [ "$initial_state" = "stopped" ]; then
 		# Container was stopped before backup - ensure it stays stopped
 		# WHY: Respect the original container state, don't start containers that were stopped
-		echo "Container $container_id was stopped before backup - ensuring it remains stopped"
-		pct stop $container_id 2>/dev/null || true
+		echo "Guest $container_id was stopped before backup - ensuring it remains stopped"
+		guest_stop "$container_id" "$guest_type"
 		return 0  # Always succeeds for stopped containers
 	elif [ "$initial_state" = "running" ]; then
 		# Container was running before backup - ensure it's running and healthy
 		# WHY: Running containers must be restored to working state after backup
-		echo "Container $container_id was running before backup - restoring to running state"
+		echo "Guest $container_id was running before backup - restoring to running state"
 		
 		# Start container if not already running
-		if ! pct status $container_id | grep -q "running"; then
-			echo "Starting container $container_id..."
-			pct start $container_id 2>/dev/null || true
+		if [[ "$(get_guest_status "$container_id" "$guest_type")" != "running" ]]; then
+			echo "Starting guest $container_id..."
+			guest_start "$container_id" "$guest_type"
 			sleep 15  # Allow time for container startup
 		fi
 		
 		# Verify container is healthy and accessible
-		if verify_container_basic_health $container_id; then
-			echo "Container $container_id successfully restored to running state"
+		if verify_container_basic_health "$container_id"; then
+			echo "Guest $container_id successfully restored to running state"
 			return 0  # Success - container running and healthy
 		else
-			echo "ERROR: Container $container_id failed to restore to healthy running state"
+			echo "ERROR: Guest $container_id failed to restore to healthy running state"
 			return 1  # Failure - container not healthy
 		fi
 	else
@@ -258,17 +420,20 @@ ensure_container_matches_initial_state() {
 # Returns: 0 if container is healthy, 1 if container has health issues
 verify_container_basic_health() {
 	local container_id=$1
+	local guest_type
 	local max_attempts=3
 	local attempt=1
+
+	guest_type="$(get_guest_type "$container_id")" || return 1
 	
 	while [ $attempt -le $max_attempts ]; do
 		echo "Health verification attempt $attempt/$max_attempts for container $container_id"
 		
 		# Check 1: Container reports running status
 		# WHY: Container must be in running state before we can verify health
-		if ! pct status $container_id | grep -q "running"; then
-			echo "Container $container_id is not running, attempting to start..."
-			pct start $container_id 2>/dev/null || true
+		if [[ "$(get_guest_status "$container_id" "$guest_type")" != "running" ]]; then
+			echo "Guest $container_id is not running, attempting to start..."
+			guest_start "$container_id" "$guest_type"
 			sleep 10
 			attempt=$((attempt + 1))
 			continue
@@ -276,11 +441,11 @@ verify_container_basic_health() {
 		
 		# Check 2: Command execution test
 		# WHY: Most critical test - if container can't execute commands, it's broken
-		if ! timeout 10 pct exec $container_id -- echo "health_verification" >/dev/null 2>&1; then
-			echo "Container $container_id command execution failed, restarting container..."
-			pct stop $container_id 2>/dev/null || true
+		if ! guest_is_command_accessible "$container_id" "$guest_type"; then
+			echo "Guest $container_id command execution failed, restarting guest..."
+			guest_stop "$container_id" "$guest_type"
 			sleep 5
-			pct start $container_id 2>/dev/null || true
+			guest_start "$container_id" "$guest_type"
 			sleep 15
 			attempt=$((attempt + 1))
 			continue
@@ -288,22 +453,23 @@ verify_container_basic_health() {
 		
 		# Check 3: Minimum process count
 		# WHY: Containers should have at least a few processes. Too few indicates service failure
-		local process_count=$(timeout 10 pct exec $container_id -- ps aux 2>/dev/null | wc -l)
+		local process_count
+		process_count="$(guest_process_count "$container_id" "$guest_type")"
 		if [ -z "$process_count" ] || [ "$process_count" -lt 3 ]; then
-			echo "Container $container_id has insufficient processes ($process_count), restarting..."
-			pct stop $container_id 2>/dev/null || true
+			echo "Guest $container_id has insufficient processes ($process_count), restarting..."
+			guest_stop "$container_id" "$guest_type"
 			sleep 5
-			pct start $container_id 2>/dev/null || true
+			guest_start "$container_id" "$guest_type"
 			sleep 15
 			attempt=$((attempt + 1))
 			continue
 		fi
 		
-		echo "Container $container_id passed basic health verification"
+		echo "Guest $container_id passed basic health verification"
 		return 0  # All checks passed - container is healthy
 	done
 	
-	echo "CRITICAL: Container $container_id failed health verification after $max_attempts attempts"
+	echo "CRITICAL: Guest $container_id failed health verification after $max_attempts attempts"
 	return 1  # Health verification failed
 }
 
@@ -437,12 +603,20 @@ backup_single_container() {
 # Returns: Always returns 0 (cleanup issues are non-critical)
 cleanup_stale_vzdump_snapshots() {
 	local container_id=$1
+	local guest_type
+
+	guest_type="$(get_guest_type "$container_id")" || return 0
 	
 	if [ "$DRY_RUN" = true ]; then
 		echo "[DRY RUN] Would check for and remove stale vzdump snapshots for container $container_id"
 		return 0
 	fi
 	
+	if [[ "$guest_type" != "lxc" ]]; then
+		echo "No stale ZFS subvolume snapshot cleanup needed for guest $container_id ($guest_type)"
+		return 0
+	fi
+
 	# Find ZFS datasets for this container that might have stale vzdump snapshots
 	# WHY: Container storage can be on different ZFS datasets, we need to check all possibilities
 	local datasets=""
@@ -488,22 +662,27 @@ cleanup_stale_vzdump_snapshots() {
 # Returns: 0 if cleanup completed, 1 if cleanup failed
 cleanup_old_backup_files() {
 	local container_id=$1
+	local guest_type
+	local backup_prefix
 	local current_date=$(date +%Y_%m_%d)
 	local cutoff_date=$(date -d "$DAYS_TO_KEEP days ago" +%Y_%m_%d)
+
+	guest_type="$(get_guest_type "$container_id")" || return 1
+	backup_prefix="$(get_backup_prefix "$guest_type")" || return 1
 	
-	echo "Cleaning old backups for container $container_id (keeping $DAYS_TO_KEEP days, cutoff date: $cutoff_date)..."
+	echo "Cleaning old backups for guest $container_id (keeping $DAYS_TO_KEEP days, cutoff date: $cutoff_date)..."
 	
 	# Find backup files for this container
 	local cleanup_result=0
 	local files_deleted=0
 	
-	for file in $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.tar $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.tar.gz $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.lzo $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.zst $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.vma $TARGET_BACKUP_DIR/vzdump-lxc-$container_id-*.log; do
+	for file in $TARGET_BACKUP_DIR/${backup_prefix}-$container_id-*.tar $TARGET_BACKUP_DIR/${backup_prefix}-$container_id-*.tar.gz $TARGET_BACKUP_DIR/${backup_prefix}-$container_id-*.lzo $TARGET_BACKUP_DIR/${backup_prefix}-$container_id-*.zst $TARGET_BACKUP_DIR/${backup_prefix}-$container_id-*.vma $TARGET_BACKUP_DIR/${backup_prefix}-$container_id-*.log; do
 		# Skip if file doesn't exist (glob didn't match)
 		[ -f "$file" ] || continue
 		
 		# Extract date from filename (format: vzdump-lxc-ID-YYYY_MM_DD-HH_MM_SS.ext)
 		local filename=$(basename "$file")
-		if [[ $filename =~ vzdump-lxc-$container_id-([0-9]{4}_[0-9]{2}_[0-9]{2})-.*\.(tar|tar\.gz|lzo|zst|vma|log) ]]; then
+		if [[ $filename =~ ${backup_prefix}-$container_id-([0-9]{4}_[0-9]{2}_[0-9]{2})-.*\.(tar|tar\.gz|lzo|zst|vma|log) ]]; then
 			local backup_date="${BASH_REMATCH[1]}"
 			
 			# Compare dates (string comparison works for YYYY_MM_DD format)
@@ -528,10 +707,10 @@ cleanup_old_backup_files() {
 	fi
 	
 	if [ $cleanup_result -eq 0 ]; then
-		echo "Successfully cleaned old backups for container $container_id (deleted $files_deleted files)"
+		echo "Successfully cleaned old backups for guest $container_id (deleted $files_deleted files)"
 		return 0  # Cleanup successful
 	else
-		echo "WARNING: Some old backup files for container $container_id could not be removed"
+		echo "WARNING: Some old backup files for guest $container_id could not be removed"
 		return 1  # Cleanup had issues
 	fi
 }
@@ -539,13 +718,19 @@ cleanup_old_backup_files() {
 # Function to verify S3 upload with retry
 verify_and_retry_s3_upload() {
 	local container_id=$1
-	local backup_files=$(find $LOCAL_BACKUP_DIR -name "vzdump-lxc-$container_id-*" -newermt "$(date +%Y-%m-%d)" -type f)
+	local guest_type
+	local backup_prefix
+	local backup_files
 	local max_retries=3
 	local retry_count=0
 
+	guest_type="$(get_guest_type "$container_id")" || return 1
+	backup_prefix="$(get_backup_prefix "$guest_type")" || return 1
+	backup_files=$(find $LOCAL_BACKUP_DIR -name "${backup_prefix}-$container_id-*" -newermt "$(date +%Y-%m-%d)" -type f)
+
 	# Handle dry run mode first
 	if [ "$DRY_RUN" = true ]; then
-		echo "[DRY RUN] Would find backup files: vzdump-lxc-$container_id-* from today"
+		echo "[DRY RUN] Would find backup files: ${backup_prefix}-$container_id-* from today"
 		echo "[DRY RUN] Would move files to $TARGET_BACKUP_DIR/"
 		echo "[DRY RUN] Would verify files in S3"
 		return 0
@@ -591,7 +776,7 @@ verify_and_retry_s3_upload() {
 		fi
 	done
 	
-	echo "Failed to upload backup for container $container_id after $max_retries attempts"
+	echo "Failed to upload backup for guest $container_id after $max_retries attempts"
 	return 1
 }
 
@@ -634,7 +819,7 @@ fi
 # WHY: Each step within backup_single_container handles its own retries.
 # No need to retry entire backup process - if backup succeeds but S3 fails, 
 # we keep the backup file and only retry S3 upload internally.
-echo "Starting backup process for containers: ${CONTAINER_LIST[*]}"
+echo "Starting backup process for guests: ${CONTAINER_LIST[*]}"
 
 for container_id in "${CONTAINER_LIST[@]}"; do
 	echo -e "\n=== Processing container $container_id ==="
@@ -666,15 +851,17 @@ for container_id in "${CONTAINER_LIST[@]}"; do
 		if [ "$DRY_RUN" = true ]; then
 			echo "[DRY RUN] Would perform final health check on container $container_id"
 		else
-			# Simple final check - just verify container can execute commands
-			if pct status $container_id | grep -q "running"; then
-				if timeout 10 pct exec $container_id -- echo "final_check" >/dev/null 2>&1; then
-					echo "Container $container_id final check: HEALTHY"
+			guest_type="$(get_guest_type "$container_id")" || continue
+
+			# Simple final check - just verify guest can execute commands
+			if [[ "$(get_guest_status "$container_id" "$guest_type")" == "running" ]]; then
+				if guest_is_command_accessible "$container_id" "$guest_type"; then
+					echo "Guest $container_id final check: HEALTHY"
 				else
-					echo "WARNING: Container $container_id not responding to commands"
+					echo "WARNING: Guest $container_id not responding to commands"
 				fi
 			else
-				echo "Container $container_id final check: STOPPED (as expected)"
+				echo "Guest $container_id final check: STOPPED (as expected)"
 			fi
 		fi
 	fi
