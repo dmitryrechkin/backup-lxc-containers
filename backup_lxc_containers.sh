@@ -61,6 +61,21 @@ EMAIL_RECIPIENT=${EMAIL_RECIPIENT:-root}
 COMPRESSION=${COMPRESSION:-gzip}
 CHECK_MOUNTPOINT=${CHECK_MOUNTPOINT:-false}
 DRY_RUN=${DRY_RUN:-false}
+# Robust off-site upload via rclone. When set, backup files are uploaded directly
+# to this rclone remote path (reliable multipart transfer) instead of being moved
+# across the FUSE-mounted TARGET_BACKUP_DIR, which fails for large files and leaves
+# them piling up in the staging directory. Example: BackupStorageS3:backup-node-1/dump
+RCLONE_REMOTE=${RCLONE_REMOTE:-}
+# Minimum free space (in MB) required in LOCAL_BACKUP_DIR before starting a dump.
+# A dump into a nearly-full staging dir aborts mid-write ("No space left on device")
+# and leaves a corrupt partial file, so we skip and alert instead. 0 disables the check.
+MIN_FREE_MB=${MIN_FREE_MB:-0}
+
+# Return free space (in whole MB) available at the given path.
+get_free_space_mb() {
+	local target_path=$1
+	df -Pm "$target_path" 2>/dev/null | awk 'NR==2 {print $4}'
+}
 
 get_guest_type() {
 	local guest_id=$1
@@ -534,6 +549,21 @@ backup_single_container() {
 	echo "🧼 Cleaning up stale snapshots before backup..."
 	cleanup_stale_vzdump_snapshots $container_id
 	
+	# Step 3-pre: ensure enough local staging space before dumping.
+	# WHY: A dump into a nearly-full staging dir aborts mid-write with
+	# "No space left on device" and leaves a corrupt partial file behind.
+	# Fail loudly with an alert instead of producing a broken backup.
+	if [ "$MIN_FREE_MB" -gt 0 ] && [ "$DRY_RUN" != true ]; then
+		local free_mb
+		free_mb=$(get_free_space_mb "$LOCAL_BACKUP_DIR")
+		if [ "${free_mb:-0}" -lt "$MIN_FREE_MB" ]; then
+			echo "❌ CRITICAL: only ${free_mb}MB free in $LOCAL_BACKUP_DIR (need ${MIN_FREE_MB}MB) - skipping dump"
+			send_failure_notification $container_id "LOW DISK SPACE" "Skipped backup of container $container_id on node $(hostname) at $(date): only ${free_mb}MB free in $LOCAL_BACKUP_DIR, below the required ${MIN_FREE_MB}MB. Earlier off-site uploads may be failing and filling the staging area - check S3 connectivity."
+			remove_backup_lock_file $container_id
+			return 1
+		fi
+	fi
+
 	echo "📦 Executing backup for container $container_id..."
 	if execute_container_backup $container_id; then
 		backup_created=true
@@ -715,6 +745,172 @@ cleanup_old_backup_files() {
 	fi
 }
 
+# Return the size in bytes of an object on the rclone remote, or empty if absent.
+get_remote_object_size() {
+	local remote_object_path=$1
+	rclone size "$remote_object_path" --json 2>/dev/null | grep -o '"bytes":[0-9]*' | cut -d: -f2
+}
+
+# Upload one local file to the rclone remote and verify the uploaded size matches
+# the local size, retrying on failure. Does NOT delete the local copy - the caller
+# decides that only after a confirmed success.
+# Returns: 0 if uploaded and verified, 1 otherwise.
+upload_and_verify_file() {
+	local local_file=$1
+	local filename
+	filename=$(basename "$local_file")
+	local local_size
+	local_size=$(stat -c %s "$local_file")
+	local max_retries=3
+	local retry_count=0
+
+	while [ $retry_count -lt $max_retries ]; do
+		echo "Uploading $filename to $RCLONE_REMOTE (attempt $((retry_count + 1))/$max_retries)..."
+		if rclone copyto "$local_file" "$RCLONE_REMOTE/$filename" --checksum --transfers 1; then
+			local remote_size
+			remote_size=$(get_remote_object_size "$RCLONE_REMOTE/$filename")
+			if [ -n "$remote_size" ] && [ "$remote_size" = "$local_size" ]; then
+				echo "Verified $filename on remote (${remote_size} bytes)"
+				return 0
+			fi
+			echo "Size mismatch for $filename (local=$local_size remote=${remote_size:-missing})"
+		else
+			echo "rclone upload failed for $filename"
+		fi
+		retry_count=$((retry_count + 1))
+		if [ $retry_count -lt $max_retries ]; then
+			local sleep_time=$((retry_count * 60))  # Linear backoff
+			echo "Retrying in $sleep_time seconds..."
+			sleep $sleep_time
+		fi
+	done
+	return 1
+}
+
+# Self-healing recovery for leftover backups from a previous run.
+# A clean run leaves LOCAL_BACKUP_DIR empty - every file is uploaded, verified, then
+# deleted. Any vzdump-* file still present at the START of a run therefore means a
+# previous run failed to offload it. We email a notification, then complete the
+# offload: files already on the remote (matching size) are simply reclaimed, the rest
+# are re-uploaded and verified before their local copy is removed. Files that still
+# cannot be offloaded are kept locally and reported as a critical problem.
+# Requires RCLONE_REMOTE. Returns: 0 if staging was clean or fully recovered, 1 if any
+# leftover file could not be offloaded.
+recover_orphaned_backups() {
+	if [ -z "$RCLONE_REMOTE" ]; then
+		return 0
+	fi
+
+	# Only completed archives/logs - never a partial .dat/.tmp from a crashed dump,
+	# which would otherwise be "verified" by size and offloaded as a corrupt backup.
+	local orphaned_files
+	orphaned_files=$(find "$LOCAL_BACKUP_DIR" -maxdepth 1 -type f \
+		\( -name 'vzdump-*.zst' -o -name 'vzdump-*.tar' -o -name 'vzdump-*.vma' -o -name 'vzdump-*.log' \) \
+		2>/dev/null | sort)
+
+	if [ -z "$orphaned_files" ]; then
+		echo "No leftover backups in $LOCAL_BACKUP_DIR - staging is clean."
+		return 0
+	fi
+
+	local orphan_count
+	orphan_count=$(printf '%s\n' "$orphaned_files" | wc -l | tr -d ' ')
+	echo "⚠️ Found $orphan_count leftover backup file(s) from a previous run in $LOCAL_BACKUP_DIR"
+
+	if [ "$DRY_RUN" = true ]; then
+		echo "[DRY RUN] Would email 'previous backups found' and attempt to re-upload:"
+		printf '%s\n' "$orphaned_files" | sed 's/^/[DRY RUN]   /'
+		return 0
+	fi
+
+	# Notify that leftovers were found BEFORE acting on them.
+	{
+		echo "Leftover backup files from a previous run were found on $(hostname) at $(date):"
+		printf '%s\n' "$orphaned_files" | sed 's/^/  - /'
+		echo ""
+		echo "Attempting to re-upload them to the off-site remote before starting new backups."
+	} | mail -s "Proxmox Backup - Previous Backups Found on $(hostname)" "$EMAIL_RECIPIENT"
+
+	local recovery_ok=true
+	local recovered=0
+	local reclaimed=0
+	local failed=0
+	local orphan
+	while IFS= read -r orphan; do
+		[ -z "$orphan" ] && continue
+		local filename
+		filename=$(basename "$orphan")
+		local local_size
+		local_size=$(stat -c %s "$orphan")
+		local remote_size
+		remote_size=$(get_remote_object_size "$RCLONE_REMOTE/$filename")
+		if [ -n "$remote_size" ] && [ "$remote_size" = "$local_size" ]; then
+			# Upload succeeded on a previous run but the local copy was never removed.
+			rm -f "$orphan" && echo "Already off-site, reclaimed staging for $filename" && reclaimed=$((reclaimed + 1))
+		elif upload_and_verify_file "$orphan"; then
+			rm -f "$orphan" && echo "Recovered (re-uploaded) $filename" && recovered=$((recovered + 1))
+		else
+			echo "❌ Could not offload leftover $filename - keeping it locally"
+			recovery_ok=false
+			failed=$((failed + 1))
+		fi
+	done <<< "$orphaned_files"
+
+	local summary="Leftover backup recovery on $(hostname) at $(date): re-uploaded ${recovered}, already-offsite ${reclaimed}, FAILED ${failed}."
+	echo "$summary"
+	if [ "$recovery_ok" = true ]; then
+		echo "$summary All leftover backups are now safely off-site." | mail -s "Proxmox Backup - Leftovers Recovered on $(hostname)" "$EMAIL_RECIPIENT"
+		return 0
+	fi
+	echo "$summary Some leftover backups could NOT be offloaded - manual attention required." | mail -s "Proxmox Backup - Leftover Recovery FAILED on $(hostname)" "$EMAIL_RECIPIENT"
+	return 1
+}
+
+# Final offload guarantee: confirm every locally-running guest we back up has today's
+# data archive present on the off-site remote. This is the completeness gate that the
+# end-of-run SUCCESS notification depends on. Requires RCLONE_REMOTE.
+# Returns: 0 only if every expected guest has today's backup off-site.
+verify_offsite_completeness() {
+	if [ -z "$RCLONE_REMOTE" ]; then
+		return 0
+	fi
+	if [ "$DRY_RUN" = true ]; then
+		echo "[DRY RUN] Would verify every local guest has today's backup on $RCLONE_REMOTE"
+		return 0
+	fi
+
+	local today
+	today=$(date +%Y_%m_%d)
+	local remote_listing
+	remote_listing=$(rclone lsf "$RCLONE_REMOTE" --files-only 2>/dev/null)
+	if [ -z "$remote_listing" ]; then
+		echo "❌ Could not list $RCLONE_REMOTE for completeness check"
+		return 1
+	fi
+
+	local missing=""
+	local container_id
+	for container_id in "${CONTAINER_LIST[@]}"; do
+		if ! check_container_runs_locally "$container_id" >/dev/null 2>&1; then
+			continue
+		fi
+		local guest_type
+		guest_type="$(get_guest_type "$container_id")" || continue
+		local backup_prefix
+		backup_prefix="$(get_backup_prefix "$guest_type")" || continue
+		if ! printf '%s\n' "$remote_listing" | grep -qE "^${backup_prefix}-${container_id}-${today}-.*\.(tar\.zst|vma\.zst)$"; then
+			missing="${missing} ${container_id}"
+		fi
+	done
+
+	if [ -z "$missing" ]; then
+		echo "✅ Off-site completeness verified: every local guest has today's backup on $RCLONE_REMOTE"
+		return 0
+	fi
+	echo "❌ Off-site completeness FAILED - missing today's off-site backup for:${missing}"
+	return 1
+}
+
 # Function to verify S3 upload with retry
 verify_and_retry_s3_upload() {
 	local container_id=$1
@@ -740,12 +936,36 @@ verify_and_retry_s3_upload() {
 		echo "No backup files found for container $container_id"
 		return 1
 	fi
-	
+
+	# Preferred path: upload each file directly to the rclone remote (reliable
+	# multipart), verify the uploaded size matches, then remove the local copy so
+	# staging space is reclaimed immediately and never accumulates un-uploaded dumps.
+	if [ -n "$RCLONE_REMOTE" ]; then
+		local all_uploaded=true
+		local backup_file
+		for backup_file in $backup_files; do
+			if upload_and_verify_file "$backup_file"; then
+				rm -f "$backup_file" && echo "Removed local copy of $(basename "$backup_file") (reclaimed staging space)"
+			else
+				echo "Giving up on $(basename "$backup_file") after retries; keeping local copy for retry"
+				all_uploaded=false
+			fi
+		done
+
+		if [ "$all_uploaded" = true ]; then
+			echo "Successfully uploaded and verified all backup files for container $container_id"
+			return 0
+		fi
+		echo "Failed to upload one or more backup files for guest $container_id"
+		return 1
+	fi
+
+	# Legacy fallback (no RCLONE_REMOTE set): move files across the mounted target dir.
 	while [ $retry_count -lt $max_retries ]; do
 		echo "Attempting to move backup files to S3 (attempt $((retry_count + 1))/$max_retries)..."
-		
+
 		# Try to move files
-		
+
 		if mv $backup_files $TARGET_BACKUP_DIR/; then
 			# Verify files actually exist in S3
 			local moved_successfully=true
@@ -757,7 +977,7 @@ verify_and_retry_s3_upload() {
 					break
 				fi
 			done
-			
+
 			if [ "$moved_successfully" = true ]; then
 				echo "Successfully moved and verified backup files for container $container_id in S3"
 				return 0
@@ -767,7 +987,7 @@ verify_and_retry_s3_upload() {
 		else
 			echo "Failed to move backup files to S3"
 		fi
-		
+
 		retry_count=$((retry_count + 1))
 		if [ $retry_count -lt $max_retries ]; then
 			local sleep_time=$((retry_count * 60))  # Exponential backoff
@@ -775,7 +995,7 @@ verify_and_retry_s3_upload() {
 			sleep $sleep_time
 		fi
 	done
-	
+
 	echo "Failed to upload backup for guest $container_id after $max_retries attempts"
 	return 1
 }
@@ -813,6 +1033,15 @@ if [ "$DRY_RUN" = true ]; then
 	echo "[DRY RUN] Would send email: Backup process started at $(date) on node $(hostname)"
 else
 	echo "Backup process started at $(date) on node $(hostname)" | mail -s "Proxmox Backup Started - Node $(hostname)" "$EMAIL_RECIPIENT"
+fi
+
+# Self-healing step: before starting new backups, recover any leftover files from a
+# previous run that failed to offload. This notifies by email, re-uploads them, and
+# reclaims staging space so a prior failure can't starve tonight's run of disk.
+echo -e "\n=== Checking for leftover backups from a previous run ==="
+if ! recover_orphaned_backups; then
+	echo "❌ Leftover backups could not all be offloaded - see alert email"
+	BACKUP_SUCCESS=false
 fi
 
 # Main backup loop - each container processed once
@@ -866,6 +1095,14 @@ for container_id in "${CONTAINER_LIST[@]}"; do
 		fi
 	fi
 done
+
+# Final offload guarantee: only declare success if every local guest actually has
+# today's backup on the off-site remote. This is what makes "guaranteed offload" real -
+# a silently skipped guest or a no-op upload turns the run into a loud FAILURE.
+echo -e "\nVerifying off-site completeness before reporting result..."
+if ! verify_offsite_completeness; then
+	BACKUP_SUCCESS=false
+fi
 
 if [ "$DRY_RUN" = true ]; then
 	echo "[DRY RUN] Analysis completed. No actual backups were performed."
